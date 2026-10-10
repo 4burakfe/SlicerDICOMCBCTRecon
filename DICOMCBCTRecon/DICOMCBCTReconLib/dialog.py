@@ -337,7 +337,7 @@ class CbctReconDialog:
         self.methodCombo = _combo(METHODS)
         self.filterCombo = _combo(recon.FILTERS)
         self.filterCombo.setCurrentIndex(recon.FILTERS.index(recon.DEFAULT_FILTER))
-        self.cutoffSpin = _doubleSpin(0.1, 1.0, 1.0, 2, 0.05)
+        self.cutoffSpin = _doubleSpin(0.1, 1.0, 0.7, 2, 0.05)
         self.cutoffSpin.setToolTip("Filter cut-off as a fraction of the Nyquist frequency (lower = smoother).")
         self.truncationSpin = _intSpin(0, 100, 25, " %")
         self.truncationSpin.setToolTip("Lateral truncation correction: each detector row is extended by this "

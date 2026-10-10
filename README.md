@@ -5,6 +5,8 @@ exports stored as one multi-frame XA or XRF DICOM object) into a 3D volume, stra
 DICOM browser. It is the cone-beam counterpart of the DICOM SPECT Reconstruction plugin and follows
 the same pattern: the run shows up as a loadable, and Load opens a reconstruction window with a preview.
 
+Author: Burak Demir, MD, FEBNM
+
 > **Built on [PyTorch](https://pytorch.org/)** (through Slicer's [PyTorch extension](https://github.com/fepegar/SlicerPyTorch))
 > and on the classic cone-beam CT literature. The reconstruction itself (FDK, short-scan weighting,
 > forward projector and SART) is implemented in this extension; the methods are those of:

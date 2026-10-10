@@ -4,12 +4,12 @@ project(DICOMCBCTRecon)
 
 #-----------------------------------------------------------------------------
 # Extension meta-information
-set(EXTENSION_HOMEPAGE "https://github.com/4burakfe/DICOMCBCTRecon")
+set(EXTENSION_HOMEPAGE "https://github.com/4burakfe/SlicerDICOMCBCTRecon")
 set(EXTENSION_CATEGORY "Reconstruction")
 set(EXTENSION_CONTRIBUTORS "Burak Demir")
 set(EXTENSION_DESCRIPTION "Cone-beam CT reconstruction of rotational C-arm X-ray runs (XA/XRF multi-frame DICOM) with FDK and SART, loaded through the DICOM browser.")
-set(EXTENSION_ICONURL "https://raw.githubusercontent.com/4burakfe/DICOMCBCTRecon/main/DICOMCBCTRecon/Resources/Icons/DICOMCBCTRecon.png")
-set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/4burakfe/DICOMCBCTRecon/main/screenshot.jpg")
+set(EXTENSION_ICONURL "https://raw.githubusercontent.com/4burakfe/SlicerDICOMCBCTRecon/main/DICOMCBCTRecon/Resources/Icons/DICOMCBCTRecon.png")
+set(EXTENSION_SCREENSHOTURLS "https://raw.githubusercontent.com/4burakfe/SlicerDICOMCBCTRecon/main/screenshot.jpg")
 set(EXTENSION_DEPENDS PyTorch)
 
 #-----------------------------------------------------------------------------

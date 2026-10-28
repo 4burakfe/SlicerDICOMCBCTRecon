@@ -1,8 +1,10 @@
 """Cone-beam reconstruction for C-arm rotational runs (PyTorch, no Slicer).
 
     lineIntegrals   detector intensities -> line integrals  p = ln(I0 / I)
-    fdk             Feldkamp-Davis-Kress filtered backprojection with Parker short-scan weights,
-                    cosine pre-weighting, apodised ramp filter and lateral truncation correction
+    fdk             Feldkamp-Davis-Kress filtered backprojection with Parker short-scan weights (or
+                    displaced-detector weights for an offset detector over a full rotation), cosine
+                    pre-weighting, apodised ramp filter, optional vertical Hann window and RTK-style
+                    lateral truncation correction
     forwardProject  ray-driven projector (trilinear sampling), used by the iterative refinement
     sart            ordered-subsets SART (simultaneous algebraic reconstruction) with non-negativity
 
@@ -162,6 +164,48 @@ def parkerWeights(geometry):
     return w.astype(np.float32)
 
 
+def displacedDetectorWeights(geometry, taper=None):
+    """Redundancy weights [views, columns] for a full rotation with a laterally displaced detector
+    (half-fan / offset detector, Wang 2002). Rays in the central band of half width `a` (seen from
+    both sides of the rotation) get a smooth sin^2 ramp so that conjugate rays sum to one; rays only
+    seen once (the wide side) get weight 1. A centred detector gives 0.5 everywhere, like Parker
+    weights of a full rotation. `taper` limits the ramp width (mm at the detector)."""
+    nViews, nCols = geometry.nViews, geometry.columns
+    halfWidth = 0.5 * nCols * geometry.du
+    u = geometry.columnPositions()[None, :] - geometry.u0[:, None]          # [views, cols] mm
+    left = -halfWidth - geometry.u0                                          # detector edges about the
+    right = halfWidth - geometry.u0                                          # principal ray
+    a = np.minimum(np.abs(left), np.abs(right))[:, None]                     # overlap half width
+    wide = np.where(np.abs(right) >= np.abs(left), 1.0, -1.0)[:, None]       # side that extends further
+    if taper is not None:
+        a = np.minimum(a, taper)
+    if np.all(np.abs(np.abs(right) - np.abs(left)) < 2 * geometry.du):
+        return np.full((nViews, nCols), 0.5, dtype=np.float32)
+    s = np.clip(wide * u / np.maximum(a, 1e-6), -1.0, 1.0)                   # -1 short edge .. +1
+    w = np.sin(0.25 * math.pi * (s + 1.0)) ** 2
+    return w.astype(np.float32)
+
+
+def isDisplacedDetector(geometry, tolerance=0.05):
+    """True when the detector is offset by more than `tolerance` of its half width."""
+    halfWidth = 0.5 * geometry.columns * geometry.du
+    return bool(np.median(np.abs(geometry.u0)) > tolerance * halfWidth)
+
+
+def isFullRotation(geometry):
+    return geometry.scanRange >= 2 * math.pi - math.radians(5.0)
+
+
+def redundancyWeights(geometry, log=print):
+    """Parker weights for a short scan, displaced-detector weights for a full rotation with an offset
+    detector (both together are not supported: Parker weights are used with a warning)."""
+    if isDisplacedDetector(geometry):
+        if isFullRotation(geometry):
+            return displacedDetectorWeights(geometry)
+        log("WARNING: displaced detector with a short scan; using Parker weights only.")
+    return parkerWeights(geometry)
+
+
 def rampKernel(nPad, tau, filterName=DEFAULT_FILTER, cutoff=1.0):
     """Frequency response (rfft, length nPad//2+1) of the band-limited ramp filter built from its
     spatial form (Kak & Slaney), so the DC term is correct, times an apodisation window.
@@ -189,35 +233,80 @@ def rampKernel(nPad, tau, filterName=DEFAULT_FILTER, cutoff=1.0):
 
 
 def _extendRows(p, extension):
-    """Lateral truncation correction: extend each detector row on both sides with its edge value
-    fading to zero along a cosine (removes the bright rim of truncated projections)."""
+    """Lateral truncation correction as in RTK's ramp filter: each row is continued past both edges
+    by its mirror image reflected about the edge value (2 p_edge - p_mirror), faded out with
+    sin^0.75 weights. Unlike RTK the extension is clamped at zero (line integrals are not negative):
+    with an untruncated object the edge is air and the reflection would add a negative copy of the
+    object, raising the reconstructed level by a few percent. p: torch [rows, cols]."""
     import torch
-    if extension <= 0:
+    n = min(int(extension), p.shape[-1] - 1)
+    if n < 2:
         return p
-    ramp = 0.5 * (1.0 + torch.cos(torch.linspace(0, math.pi, extension, device=p.device, dtype=p.dtype)))
-    left = p[..., :1] * ramp.flip(0)
-    right = p[..., -1:] * ramp
+    i = torch.arange(n, device=p.device, dtype=p.dtype)
+    w = torch.sin((n - i) * math.pi / (2 * n - 2)) ** 0.75
+    left = (w * (2 * p[..., :1] - p[..., 1:n + 1]).clamp(min=0.0)).flip(-1)
+    right = w * (2 * p[..., -1:] - p[..., -n - 1:-1].flip(-1)).clamp(min=0.0)
     return torch.cat([left, p, right], dim=-1)
 
 
+def _hannWindow(n, cutoff, device):
+    """Hann window over rfft frequencies of length n; cutoff = fraction of Nyquist."""
+    import torch
+    f = torch.fft.rfftfreq(n, device=device)
+    x = f / (0.5 * max(1e-3, min(1.0, cutoff)))
+    return torch.where(x > 1.0, torch.zeros_like(x), 0.5 * (1.0 + torch.cos(math.pi * x.clamp(0, 1))))
+
+
+def paddedGeometry(geometry, padLeft, padRight):
+    """Copy of the geometry with the detector widened by padLeft / padRight columns (eu side -/+)."""
+    import copy
+    if not padLeft and not padRight:
+        return geometry
+    g = copy.copy(geometry)
+    g.columns = geometry.columns + padLeft + padRight
+    shift = 0.5 * (padRight - padLeft) * geometry.du
+    g.setVectors(geometry.source, geometry.detCenter + shift * geometry.eu, geometry.eu, geometry.ev)
+    return g
+
+
 def filterProjections(p, geometry, filterName=DEFAULT_FILTER, cutoff=1.0, truncationExtension=0.25,
-                      weights=None, device=None, progress=None, shouldAbort=None, batch=16):
-    """Cosine pre-weighting, redundancy weights and ramp filtering along the detector rows.
-    p: numpy [views, rows, cols] line integrals. Returns a torch tensor on `device`, already
-    multiplied by the angular interval of each view, ready for backprojection."""
+                      weights=None, device=None, progress=None, shouldAbort=None, batch=16, cutoffV=None):
+    """Cosine pre-weighting, redundancy weights and ramp filtering along the detector rows, done the
+    way RTK's FDK does it: the redundancy weights are applied before the ramp filter, a displaced
+    detector is zero-padded on its short side to be symmetric about the central ray, then rows are
+    extended for truncation correction (fraction of the padded width) and filtered.
+    cutoffV, when given, adds a Hann window along the detector's vertical axis (RTK HannCutFrequencyY).
+    p: numpy [views, rows, cols] line integrals. Returns (q, filteredGeometry): q is a torch tensor
+    on `device`, already multiplied by the angular interval of each view, ready for backprojection
+    with filteredGeometry. For a displaced detector q keeps the zero-padded columns: their filtered
+    values (the ramp's negative tails) are needed, dropping them biases the periphery upwards."""
     import torch
     device = device or torchDevice()
     nViews, rows, cols = p.shape
-    extension = int(round(truncationExtension * cols)) if truncationExtension else 0
-    nTotal = cols + 2 * extension
+    if weights is None:
+        weights = redundancyWeights(geometry)
+    padLeft = padRight = 0
+    if isDisplacedDetector(geometry) and isFullRotation(geometry):
+        u0 = float(np.median(geometry.u0))
+        padCols = int(round(2.0 * abs(u0) / geometry.du))
+        if u0 > 0:      # principal ray right of centre: the left part is the wide side
+            padRight = padCols
+        else:
+            padLeft = padCols
+    width = cols + padLeft + padRight
+    extension = int(round(truncationExtension * width)) if truncationExtension else 0
+    extension = min(extension, width - 1) if extension >= 2 else 0
+    nTotal = width + 2 * extension
     nPad = 1 << int(math.ceil(math.log2(2 * nTotal)))
     tauDetector = geometry.du
+    windowV = None
+    if cutoffV is not None:
+        nPadV = 1 << int(math.ceil(math.log2(2 * rows)))
+        windowV = _hannWindow(nPadV, cutoffV, device)[:, None]
     u = torch.as_tensor(geometry.columnPositions(), dtype=torch.float32, device=device)
     v = torch.as_tensor(geometry.rowPositions(), dtype=torch.float32, device=device)
-    if weights is None:
-        weights = parkerWeights(geometry)
     weights = torch.as_tensor(weights, dtype=torch.float32, device=device)
-    out = torch.empty((nViews, rows, cols), dtype=torch.float32, device=device)
+    out = torch.empty((nViews, rows, width), dtype=torch.float32, device=device)
     kernels = {}
     for start in range(0, nViews, batch):
         stop = min(nViews, start + batch)
@@ -228,7 +317,9 @@ def filterProjections(p, geometry, filterName=DEFAULT_FILTER, cutoff=1.0, trunca
             uu = (u - float(geometry.u0[i]))[None, :]
             vv = (v - float(geometry.v0[i]))[:, None]
             cosine = sdd / torch.sqrt(sdd * sdd + uu * uu + vv * vv)
-            row = block[k] * cosine
+            row = block[k] * cosine * weights[i][None, :]
+            if padLeft or padRight:
+                row = torch.nn.functional.pad(row, (padLeft, padRight))
             row = _extendRows(row, extension)
             # Filter on the virtual detector through the isocenter (pixel size du * SOD / SDD)
             tau = tauDetector * sod / sdd
@@ -236,9 +327,12 @@ def filterProjections(p, geometry, filterName=DEFAULT_FILTER, cutoff=1.0, trunca
             if key not in kernels:
                 kernels[key] = torch.as_tensor(rampKernel(nPad, tau, filterName, cutoff), device=device)
             spectrum = torch.fft.rfft(row, n=nPad, dim=-1) * kernels[key]
-            filtered = torch.fft.irfft(spectrum, n=nPad, dim=-1)[:, extension:extension + cols]
-            out[i] = filtered * weights[i][None, :] * float(geometry.dBeta[i])
-    return out
+            filtered = torch.fft.irfft(spectrum, n=nPad, dim=-1)[:, extension:extension + width]
+            if windowV is not None:
+                nV = windowV.shape[0] * 2 - 2
+                filtered = torch.fft.irfft(torch.fft.rfft(filtered, n=nV, dim=0) * windowV, n=nV, dim=0)[:rows]
+            out[i] = filtered * float(geometry.dBeta[i])
+    return out, paddedGeometry(geometry, padLeft, padRight)
 
 
 # ---------------------------------------------------------------------------
@@ -306,9 +400,9 @@ def backproject(q, geometry, grid, fdkWeighting=True, views=None, device=None,
 
 
 def fdk(p, geometry, grid, filterName=DEFAULT_FILTER, cutoff=1.0, truncationExtension=0.25,
-        device=None, progress=None, shouldAbort=None, maskOutsideFov=True, log=print):
+        device=None, progress=None, shouldAbort=None, maskOutsideFov=True, log=print, cutoffV=None):
     """FDK reconstruction of line integrals p (numpy [views, rows, cols]). Returns numpy [nz, ny, nx]
-    in 1/mm."""
+    in 1/mm. cutoffV: optional Hann cut-off along the detector's vertical axis."""
     import torch
     device = device or torchDevice()
     shortScan = geometry.shortScanRange()
@@ -319,26 +413,52 @@ def fdk(p, geometry, grid, filterName=DEFAULT_FILTER, cutoff=1.0, truncationExte
         log(f"Note: the run covers {math.degrees(geometry.scanRange):.1f} deg, slightly less than the "
             f"{math.degrees(shortScan):.1f} deg a short scan needs; the outer part of the fan is weighted "
             "approximately.")
-    q = filterProjections(p, geometry, filterName, cutoff, truncationExtension, device=device,
-                          progress=progress, shouldAbort=shouldAbort)
-    coverage = torch.zeros(grid.shape, dtype=torch.float32, device=device) if maskOutsideFov else None
-    volume = backproject(q, geometry, grid, fdkWeighting=True, device=device, progress=progress,
+    q, filtered = filterProjections(p, geometry, filterName, cutoff, truncationExtension, device=device,
+                                    progress=progress, shouldAbort=shouldAbort, cutoffV=cutoffV)
+    padded = filtered is not geometry
+    # Coverage of the padded detector is not the field of view: fovMask then does a separate pass
+    coverage = torch.zeros(grid.shape, dtype=torch.float32, device=device) if maskOutsideFov and not padded else None
+    volume = backproject(q, filtered, grid, fdkWeighting=True, device=device, progress=progress,
                          shouldAbort=shouldAbort, coverage=coverage)
+    del q
     if coverage is not None:
         volume[coverage < FOV_COVERAGE * float(geometry.dBeta.sum())] = 0.0
-    del q
+    elif maskOutsideFov:
+        mask = fovMask(geometry, grid, device=device, progress=progress, shouldAbort=shouldAbort)
+        volume[torch.as_tensor(~mask, device=volume.device)] = 0.0
     return volume.cpu().numpy()
 
 
 def fovMask(geometry, grid, device=None, progress=None, shouldAbort=None):
-    """Boolean numpy [nz, ny, nx]: voxels seen by (nearly) every view, the region FDK keeps."""
+    """Boolean numpy [nz, ny, nx]: the region FDK can reconstruct. Centred detector: voxels seen by
+    (nearly) every view. Displaced detector over a full rotation: voxels seen in at least half of the
+    rotation and within the reach of the wide side of the detector."""
     import torch
     device = device or torchDevice()
     coverage = torch.zeros(grid.shape, dtype=torch.float32, device=device)
     dummy = torch.zeros((geometry.nViews, 1, 1), dtype=torch.float32, device=device)  # only coverage is used
     backproject(dummy, geometry, grid, fdkWeighting=False, device=device, progress=progress,
                 shouldAbort=shouldAbort, label="Field of view", coverage=coverage)
-    return (coverage >= FOV_COVERAGE * float(geometry.dBeta.sum())).cpu().numpy()
+    coverage = (coverage / float(geometry.dBeta.sum())).cpu().numpy()
+    if not (isDisplacedDetector(geometry) and isFullRotation(geometry)):
+        return coverage >= FOV_COVERAGE
+    halfWidth = 0.5 * geometry.columns * geometry.du
+    reach = float(np.min(geometry.sod * np.sin(np.arctan((halfWidth + np.abs(geometry.u0)) / geometry.sdd))))
+    # Rotation axis: normal of the plane of the source trajectory, through the centre of the circle
+    # fitted to it (the mean of the sources is off when the views are not spread evenly)
+    mean = geometry.source.mean(axis=0)
+    axis = np.linalg.svd(geometry.source - mean)[2][-1]
+    a = np.hstack([2.0 * geometry.source, np.ones((geometry.nViews, 1))])
+    a = np.vstack([a, np.append(axis, 0.0)])                    # keep the centre in the source plane:
+    b = np.append(np.sum(geometry.source ** 2, axis=1), float(axis @ mean))   # axis . c = axis . mean
+    centre = np.linalg.lstsq(a, b, rcond=None)[0][:3]
+    xs, ys, zs = grid.axes()
+    x = (xs - centre[0]).astype(np.float32)[None, None, :]
+    y = (ys - centre[1]).astype(np.float32)[None, :, None]
+    z = (zs - centre[2]).astype(np.float32)[:, None, None]
+    along = x * axis[0] + y * axis[1] + z * axis[2]
+    radial2 = x * x + y * y + z * z - along * along
+    return (coverage >= 0.5) & (radial2 <= reach * reach)
 
 
 # ---------------------------------------------------------------------------
@@ -402,15 +522,55 @@ def forwardProject(volume, geometry, grid, views=None, device=None, stepFraction
     return out
 
 
+def _gaussianBlur2d(images, sigma):
+    """Separable Gaussian blur of torch [n, rows, cols] (sigma in pixels), edges replicated."""
+    import torch
+    import torch.nn.functional as F
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    x = torch.arange(-radius, radius + 1, dtype=images.dtype, device=images.device)
+    k = torch.exp(-0.5 * (x / sigma) ** 2)
+    k = k / k.sum()
+    out = images[:, None]
+    out = F.conv2d(F.pad(out, (radius, radius, 0, 0), mode="replicate"), k.view(1, 1, 1, -1))
+    out = F.conv2d(F.pad(out, (0, 0, radius, radius), mode="replicate"), k.view(1, 1, -1, 1))
+    return out[:, 0]
+
+
+def removeLowFrequencyInconsistency(measured, volume, geometry, grid, sigmaMm=10.0, batch=8,
+                                    progress=None, shouldAbort=None):
+    """Subtract from measured (torch [views, rows, cols], in place) the smooth part of
+    measured - forwardProject(volume). Measured line integrals carry low-frequency terms no volume in
+    the grid explains (an I0 or air level off zero, mass beyond the grid, scatter); FDK's ramp filter
+    all but ignores them, SART spreads them over the grid as rings and fog. Removing them keeps the
+    FDK's scale and lets SART refine the detail only. sigmaMm: Gaussian width at the detector.
+    Returns the mean removed offset."""
+    sigma = sigmaMm / geometry.du
+    total = 0.0
+    for start in range(0, geometry.nViews, batch):
+        views = list(range(start, min(geometry.nViews, start + batch)))
+        _check(progress, shouldAbort, "SART", 0, 1, f"Data consistency: views {start + 1}-{views[-1] + 1}")
+        estimate = forwardProject(volume, geometry, grid, views)
+        bias = _gaussianBlur2d(measured[views] - estimate, sigma)
+        measured[views] -= bias
+        total += float(bias.sum())
+    return total / measured.numel()
+
+
 def sart(p, geometry, grid, iterations=3, subsets=12, relaxation=0.5, initial=None, device=None,
-         progress=None, shouldAbort=None, log=print, nonNegative=True):
+         progress=None, shouldAbort=None, log=print, nonNegative=True, consistencySigmaMm=10.0):
     """Ordered-subsets SART. p: numpy line integrals [views, rows, cols]; initial: numpy volume
-    (e.g. the FDK result) or None. Returns numpy [nz, ny, nx] in 1/mm."""
+    (e.g. the FDK result) or None. With an initial volume and consistencySigmaMm, the low-frequency
+    mismatch between the data and the initial volume is removed first (see
+    removeLowFrequencyInconsistency). Returns numpy [nz, ny, nx] in 1/mm."""
     import torch
     device = device or torchDevice()
     measured = torch.as_tensor(p, dtype=torch.float32, device=device)
     volume = (torch.as_tensor(initial, dtype=torch.float32, device=device).clone() if initial is not None
               else torch.zeros(grid.shape, dtype=torch.float32, device=device))
+    if initial is not None and consistencySigmaMm:
+        offset = removeLowFrequencyInconsistency(measured, volume, geometry, grid, consistencySigmaMm,
+                                                 progress=progress, shouldAbort=shouldAbort)
+        log(f"Removed the low-frequency data mismatch to the initial volume (mean {offset:.3f}).")
     ones = torch.ones(grid.shape, dtype=torch.float32, device=device)
     nViews = geometry.nViews
     subsets = max(1, min(subsets, nViews))

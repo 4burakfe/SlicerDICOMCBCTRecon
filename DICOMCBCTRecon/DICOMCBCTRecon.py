@@ -6,7 +6,9 @@ object whose positioner angle changes from frame to frame over at least 120 degr
 browser. On Load, opens a reconstruction window with the raw projections in cine, axial/coronal/
 sagittal previews and the reconstruction settings:
     FDK            filtered backprojection for circular cone-beam data with Parker short-scan
-                   weighting, cosine pre-weighting, apodised ramp filter, lateral truncation correction
+                   weighting (displaced-detector weighting for an offset detector over a full rotation),
+                   cosine pre-weighting, apodised ramp filter, vertical Hann window, lateral truncation
+                   correction
     FDK + SART     FDK followed by a few ordered-subsets SART iterations
     SART           iterative only (start from zero)
 Geometry comes from the DICOM header: per-frame primary/secondary angles (PositionerPrimaryAngle

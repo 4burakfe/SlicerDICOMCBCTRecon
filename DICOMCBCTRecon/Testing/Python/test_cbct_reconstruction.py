@@ -183,6 +183,22 @@ class FdkTest(unittest.TestCase):
         corrected = centralError(R.fdk(p, geo, GRID, truncationExtension=0.5, log=SILENT), truth)
         self.assertLess(corrected, plain)
 
+    def test_uniform_cylinder_is_flat(self):
+        # Centred detector over a short scan, and a detector displaced by 90 mm over a full rotation
+        # (half fan: only the displaced-detector weights and padding reconstruct the wide cylinder)
+        grid = G.ReconGrid((128, 128, 16), (1.8, 1.8, 1.8))
+        x, y, _ = grid.axes()
+        r = np.hypot(*np.meshgrid(x, y, indexing="xy"))
+        for arc, nFrames, shift, radius in ((200.0, 151, 0.0, 70.0), (360.0, 240, 90.0, 110.0)):
+            header = P.syntheticRunHeader(nFrames=nFrames, arcDeg=arc, rows=96, columns=96, pixelMm=3.2)
+            geo = G.ProjectionGeometry(header, {"offsetU": shift})
+            self.assertEqual(R.isDisplacedDetector(geo), shift != 0.0)
+            cylinder = [((0.0, 0.0, 0.0), (radius, radius, 400.0), 0.02)]
+            volume = R.fdk(P.projectPhantom(geo, cylinder), geo, grid, "Hann", 0.7, log=SILENT, cutoffV=0.7)
+            middle = volume[6:10]
+            rings = [float(middle[:, (r >= a) & (r < a + 10.0)].mean()) for a in np.arange(0.0, 0.8 * radius, 10.0)]
+            self.assertLess(max(abs(m - 0.02) for m in rings), 0.0003, f"arc {arc}, shift {shift}: {rings}")
+
 
 class ProjectorAndSartTest(unittest.TestCase):
     def test_forward_projector_matches_analytic(self):
@@ -210,6 +226,22 @@ class ProjectorAndSartTest(unittest.TestCase):
         before = float(np.abs(start - truth)[core].mean())
         after = float(np.abs(refined - truth)[core].mean())
         self.assertLess(after, before * 1.05)
+
+    def test_sart_ignores_smooth_data_offset(self):
+        # An offset on every line integral (I0 off, air not at zero) is mostly filtered out by FDK;
+        # SART starting from FDK must keep the FDK level rather than turn the offset into fog
+        header = P.syntheticRunHeader(nFrames=60, arcDeg=200.0, rows=64, columns=64, pixelMm=4.8)
+        geo = G.ProjectionGeometry(header)
+        grid = G.ReconGrid((64, 64, 16), (2.7, 2.7, 2.7))
+        cylinder = [((0.0, 0.0, 0.0), (60.0, 60.0, 400.0), 0.02)]
+        p = P.projectPhantom(geo, cylinder) + 0.5
+        start = R.fdk(p, geo, grid, log=SILENT)
+        refined = R.sart(p, geo, grid, iterations=2, subsets=6, initial=start, log=SILENT)
+        plain = R.sart(p, geo, grid, iterations=2, subsets=6, initial=start, log=SILENT, consistencySigmaMm=0)
+        core = (slice(6, 10), slice(18, 46), slice(18, 46))
+        level = float(start[core].mean())
+        self.assertAlmostEqual(float(refined[core].mean()), level, delta=0.0001)
+        self.assertGreater(float(plain[core].mean()), level + 0.0004)
 
 
 class DicomRoundTripTest(unittest.TestCase):

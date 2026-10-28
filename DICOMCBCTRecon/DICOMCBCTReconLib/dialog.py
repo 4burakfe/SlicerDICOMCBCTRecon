@@ -339,9 +339,14 @@ class CbctReconDialog:
         self.filterCombo.setCurrentIndex(recon.FILTERS.index(recon.DEFAULT_FILTER))
         self.cutoffSpin = _doubleSpin(0.1, 1.0, 0.7, 2, 0.05)
         self.cutoffSpin.setToolTip("Filter cut-off as a fraction of the Nyquist frequency (lower = smoother).")
+        self.cutoffVSpin = _doubleSpin(0.1, 1.0, 0.7, 2, 0.05)
+        self.cutoffVSpin.setToolTip("Hann window along the detector columns (vertical), as a fraction of the "
+                                    "Nyquist frequency: smooths between slices. Follows the cut-off until changed.")
+        self.lastCutoff = 0.7  # the vertical cut-off follows the cut-off while they are equal
         self.truncationSpin = _intSpin(0, 100, 25, " %")
         self.truncationSpin.setToolTip("Lateral truncation correction: each detector row is extended by this "
-                                       "fraction of its width, fading to zero. 0 switches it off.")
+                                       "fraction of its width with its mirror image about the edge value, "
+                                       "fading to zero. 0 switches it off.")
         self.itersSpin = _intSpin(1, 50, 3)
         self.subsetsSpin = _intSpin(1, 100, 12)
         self.relaxSpin = _doubleSpin(0.05, 1.5, 0.5, 2, 0.05)
@@ -360,6 +365,8 @@ class CbctReconDialog:
         grid.addWidget(self.cutoffSpin, 1, 3)
         grid.addWidget(qt.QLabel("Truncation:"), 2, 0)
         grid.addWidget(self.truncationSpin, 2, 1)
+        grid.addWidget(qt.QLabel("Vertical cut-off:"), 2, 2)
+        grid.addWidget(self.cutoffVSpin, 2, 3)
         grid.addWidget(qt.QLabel("SART iterations:"), 3, 0)
         grid.addWidget(self.itersSpin, 3, 1)
         grid.addWidget(qt.QLabel("Subsets:"), 3, 2)
@@ -368,6 +375,7 @@ class CbctReconDialog:
         grid.addWidget(self.relaxSpin, 4, 1)
         grid.addWidget(self.cpuCheckBox, 5, 0, 1, 4)
         self.methodCombo.connect("currentIndexChanged(int)", self._updateMethodState)
+        self.cutoffSpin.connect("valueChanged(double)", self._updateCutoffV)
         side.addWidget(box)
 
         # Volume and units
@@ -446,7 +454,7 @@ class CbctReconDialog:
         for widget in (self.itersSpin, self.subsetsSpin, self.relaxSpin):
             widget.setEnabled(iterative)
         filtered = self.methodCombo.currentText != METHOD_SART
-        for widget in (self.filterCombo, self.cutoffSpin):
+        for widget in (self.filterCombo, self.cutoffSpin, self.cutoffVSpin):
             widget.setEnabled(filtered)
         # Switch the SART settings to the new method's defaults unless the user has changed them
         method = self.methodCombo.currentText
@@ -460,6 +468,12 @@ class CbctReconDialog:
             self.relaxSpin.setValue(relaxation)
         self.lastIterativeMethod = method
 
+    def _updateCutoffV(self, value):
+        # Keep the vertical cut-off equal to the cut-off unless the user has set it apart
+        if round(float(self.cutoffVSpin.value), 2) == round(self.lastCutoff, 2):
+            self.cutoffVSpin.setValue(value)
+        self.lastCutoff = float(value)
+
     def _updateUnitsState(self, *args):
         self.muWaterSpin.setEnabled(self.unitsCombo.currentText == UNITS_HU)
         self.muWaterSpin.setToolTip("Water attenuation for the HU scale (fixed-water mode, and for subtracted runs).")
@@ -468,9 +482,9 @@ class CbctReconDialog:
         watched = [self.intensityCombo, self.i0Combo, self.i0Spin, self.binningCombo, self.subtractCombo,
                    self.flipColumnsCheckBox, self.flipRowsCheckBox, self.negateCheckBox, self.angleOffsetSpin,
                    self.offsetUSpin, self.offsetVSpin, self.methodCombo, self.filterCombo, self.cutoffSpin,
-                   self.truncationSpin, self.itersSpin, self.subsetsSpin, self.relaxSpin, self.matrixCombo,
-                   self.voxelSpin, self.slicesSpin, self.unitsCombo, self.muWaterSpin, self.cropCheckBox,
-                   self.calibrationCheckBox]
+                   self.cutoffVSpin, self.truncationSpin, self.itersSpin, self.subsetsSpin, self.relaxSpin,
+                   self.matrixCombo, self.voxelSpin, self.slicesSpin, self.unitsCombo, self.muWaterSpin,
+                   self.cropCheckBox, self.calibrationCheckBox]
         for widget in watched:
             if isinstance(widget, qt.QDoubleSpinBox):
                 signal = "valueChanged(double)"
@@ -502,6 +516,7 @@ class CbctReconDialog:
             "method": self.methodCombo.currentText,
             "filter": self.filterCombo.currentText,
             "cutoff": float(self.cutoffSpin.value),
+            "cutoffV": float(self.cutoffVSpin.value),
             "truncation": int(self.truncationSpin.value) / 100.0,
             "iterations": int(self.itersSpin.value),
             "subsets": int(self.subsetsSpin.value),
@@ -762,7 +777,7 @@ class CbctReconDialog:
                 if params["method"] in (METHOD_FDK, METHOD_FDK_SART):
                     volume = recon.fdk(p, projectionGeometry, grid, params["filter"], params["cutoff"],
                                        params["truncation"], device=device, maskOutsideFov=params["cropFov"],
-                                       log=self.log, **kwargs)
+                                       log=self.log, cutoffV=params.get("cutoffV"), **kwargs)
                 if params["method"] in (METHOD_FDK_SART, METHOD_SART):
                     volume = recon.sart(p, projectionGeometry, grid, params["iterations"], params["subsets"],
                                         params["relaxation"], initial=volume, device=device, log=self.log,
@@ -820,7 +835,7 @@ class CbctReconDialog:
             "VoxelMm": f"{grid.sx:.3f}",
         }
         if params["method"] != METHOD_SART:
-            info["Filter"] = f"{params['filter']} cutoff {params['cutoff']:.2f}"
+            info["Filter"] = f"{params['filter']} cutoff {params['cutoff']:.2f}, vertical Hann {params['cutoffV']:.2f}"
         if params["method"] != METHOD_FDK:
             info["SART"] = f"{params['iterations']} iterations x {params['subsets']} subsets, relaxation {params['relaxation']}"
         if params.get("muWaterUsed"):
